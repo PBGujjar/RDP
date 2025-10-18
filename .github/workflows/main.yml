@@ -1,4 +1,4 @@
-name: RDP
+name: RDP (Fixed Password + Embedded Tailscale Key)
 
 on:
   workflow_dispatch:
@@ -19,22 +19,22 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # Disable Network Level Authentication (if needed)
+          # (Optional) Relax NLA if needed
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'SecurityLayer' -Value 0 -Force
 
-          # Firewall rule for RDP (remove existing then add)
+          # Firewall rule for RDP
           netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          # Restart Remote Desktop service
+          # Restart Remote Desktop service to apply changes
           Restart-Service -Name TermService -Force
 
       - name: Create/Update RDP User with Fixed Password
         run: |
-          $fixedPassword = "Gurjar"  # <-- Fixed password
+          $fixedPassword = "Gurjar"  # <-- fixed password requested
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
 
           if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
@@ -47,7 +47,7 @@ jobs:
               Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP'
           }
 
-          # Export credentials for later steps (and session)
+          # Export credentials for subsequent steps
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: RDP | Password: $fixedPassword"
           $env:RDP_CREDS = "User: RDP | Password: $fixedPassword"
 
@@ -63,8 +63,6 @@ jobs:
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $tailscaleExe = Join-Path -Path $env:ProgramFiles -ChildPath 'Tailscale\tailscale.exe'
           if (-not (Test-Path $tailscaleExe)) {
@@ -72,10 +70,14 @@ jobs:
               exit 1
           }
 
+          # Embedded auth key you provided (note: exposing key publicly is risky)
+          $authKey = "tskey-auth-kfwPw32Zkb11CNTRL-UcY3V2VN9vC6ovzxjTdnuCN8DMP2vs5K"
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
-          & $tailscaleExe up --authkey="${env:TAILSCALE_AUTH_KEY}" --hostname="$hostname"
 
-          # Wait for Tailscale IP
+          # Bring up tailscale
+          & $tailscaleExe up --authkey="$authKey" --hostname="$hostname" --accept-routes --accept-dns=true
+
+          # Wait for Tailscale IPv4 address
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 12) {
@@ -92,7 +94,7 @@ jobs:
           }
 
           if (-not $tsIP) {
-              Write-Error "No Tailscale IP assigned."
+              Write-Error "No Tailscale IP assigned after retries."
               exit 1
           }
 
@@ -102,7 +104,13 @@ jobs:
 
       - name: Verify RDP Port
         run: |
-          Write-Host "Testing RDP at $env:TAILSCALE_IP:3389"
+          # Use runtime env var (set earlier via GITHUB_ENV)
+          if (-not $env:TAILSCALE_IP) {
+              Write-Error "TAILSCALE_IP not set in environment."
+              exit 1
+          }
+
+          Write-Host "Testing TCP to $env:TAILSCALE_IP:3389"
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to port 3389 failed"
@@ -110,24 +118,20 @@ jobs:
           }
           Write-Host "✅ RDP Port 3389 reachable!"
 
-      - name: Maintain Connection (timed keep-alive)
-        env:
-          RDP_CREDS: ${{ env.RDP_CREDS }}
-          TAILSCALE_IP: ${{ env.TAILSCALE_IP }}
-          KEEP_ALIVE_MINUTES: 360   # change if needed
+      - name: Maintain Connection (timed keep-alive; credentials masked)
         run: |
-          # Mask the creds string in runner logs
-          Write-Host "::add-mask::${env:RDP_CREDS}"
+          # Mask credentials so they are hidden in logs
+          if ($env:RDP_CREDS) {
+              Write-Host "::add-mask::${env:RDP_CREDS}"
+          }
 
-          # Print connection details (credentials masked)
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $($env:TAILSCALE_IP)"
           Write-Host "Username: RDP"
           Write-Host "Password: Gurjar"
           Write-Host "==================`n"
 
-          # Keep runner active for configured minutes (no infinite loop)
-          $minutes = [int]$env:KEEP_ALIVE_MINUTES
+          $minutes = 360
           $endTime = (Get-Date).AddMinutes($minutes)
           while ((Get-Date) -lt $endTime) {
               Write-Host "[$(Get-Date -Format o)] RDP Active - will stop at $($endTime.ToString('o'))"
