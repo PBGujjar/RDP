@@ -1,4 +1,4 @@
-name: RDP (Fixed Password + Embedded Tailscale Key)
+name: RDP (Fixed Password - Compatible)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # (Optional) Relax NLA if needed
+          # (Optional) Adjust NLA if required
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -29,29 +29,36 @@ jobs:
           netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          # Restart Remote Desktop service to apply changes
           Restart-Service -Name TermService -Force
 
-      - name: Create/Update RDP User with Fixed Password
+      - name: Create/Update RDP User with Complex Fixed Password
         run: |
-          $fixedPassword = "Gurjar"  # <-- fixed password requested
+          # NOTE: Windows enforces password complexity. Plain "Gurjar" will fail.
+          # We'll keep "Gurjar" as the base and append characters to satisfy policy.
+          $fixedPassword = "Gurjar@2025!"   # <-- Complex password (meets Windows rules)
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
 
-          if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
-              Write-Host "User 'RDP' exists – updating password."
-              Set-LocalUser -Name 'RDP' -Password $securePass
-          } else {
-              Write-Host "Creating new RDP user."
-              New-LocalUser -Name 'RDP' -Password $securePass -FullName 'RDP User' -Description 'Fixed Password Account' -AccountNeverExpires
-              Add-LocalGroupMember -Group 'Administrators' -Member 'RDP'
-              Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP'
+          try {
+              if (Get-LocalUser -Name 'RDP' -ErrorAction SilentlyContinue) {
+                  Write-Host "User 'RDP' exists – updating password."
+                  Set-LocalUser -Name 'RDP' -Password $securePass -ErrorAction Stop
+              } else {
+                  Write-Host "Creating new RDP user."
+                  New-LocalUser -Name 'RDP' -Password $securePass -FullName 'RDP User' -Description 'Fixed Password Account' -AccountNeverExpires -ErrorAction Stop
+                  Add-LocalGroupMember -Group 'Administrators' -Member 'RDP' -ErrorAction SilentlyContinue
+                  Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP' -ErrorAction SilentlyContinue
+              }
+
+              # Export credentials to GITHUB_ENV for runtime steps
+              Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: RDP | Password: $fixedPassword"
+              $env:RDP_CREDS = "User: RDP | Password: $fixedPassword"
+
+              Write-Host "✅ RDP user ready. Username: RDP, Password: $fixedPassword"
           }
-
-          # Export credentials for subsequent steps
-          Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: RDP | Password: $fixedPassword"
-          $env:RDP_CREDS = "User: RDP | Password: $fixedPassword"
-
-          Write-Host "✅ RDP user ready. Username: RDP, Password: Gurjar"
+          catch {
+              Write-Error "Failed creating/updating 'RDP' user: $($_.Exception.Message)"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
@@ -70,14 +77,13 @@ jobs:
               exit 1
           }
 
-          # Embedded auth key you provided (note: exposing key publicly is risky)
+          # Embedded auth key (as you asked). Consider moving into secrets for safety.
           $authKey = "tskey-auth-kfwPw32Zkb11CNTRL-UcY3V2VN9vC6ovzxjTdnuCN8DMP2vs5K"
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
 
-          # Bring up tailscale
           & $tailscaleExe up --authkey="$authKey" --hostname="$hostname" --accept-routes --accept-dns=true
 
-          # Wait for Tailscale IPv4 address
+          # Wait for IPv4
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 12) {
@@ -104,31 +110,27 @@ jobs:
 
       - name: Verify RDP Port
         run: |
-          # Use runtime env var (set earlier via GITHUB_ENV)
           if (-not $env:TAILSCALE_IP) {
-              Write-Error "TAILSCALE_IP not set in environment."
+              Write-Error "TAILSCALE_IP not set."
               exit 1
           }
 
-          Write-Host "Testing TCP to $env:TAILSCALE_IP:3389"
+          Write-Host "Testing RDP at $env:TAILSCALE_IP:3389"
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to port 3389 failed"
+              Write-Error "TCP connection to 3389 failed"
               exit 1
           }
           Write-Host "✅ RDP Port 3389 reachable!"
 
-      - name: Maintain Connection (timed keep-alive; credentials masked)
+      - name: Maintain Connection (timed keep-alive)
         run: |
-          # Mask credentials so they are hidden in logs
-          if ($env:RDP_CREDS) {
-              Write-Host "::add-mask::${env:RDP_CREDS}"
-          }
+          if ($env:RDP_CREDS) { Write-Host "::add-mask::${env:RDP_CREDS}" }
 
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $($env:TAILSCALE_IP)"
           Write-Host "Username: RDP"
-          Write-Host "Password: Gurjar"
+          Write-Host "Password: Gurjar@2025!"
           Write-Host "==================`n"
 
           $minutes = 360
