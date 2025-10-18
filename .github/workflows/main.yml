@@ -1,4 +1,4 @@
-name: RDP (Fixed Password - Compatible)
+name: RDP (Fixed Complex Password)
 
 on:
   workflow_dispatch:
@@ -15,27 +15,22 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # (Optional) Adjust NLA if required
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'SecurityLayer' -Value 0 -Force
 
-          # Firewall rule for RDP
           netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
           Restart-Service -Name TermService -Force
 
       - name: Create/Update RDP User with Complex Fixed Password
         run: |
-          # NOTE: Windows enforces password complexity. Plain "Gurjar" will fail.
-          # We'll keep "Gurjar" as the base and append characters to satisfy policy.
-          $fixedPassword = "Gurjar@2025!"   # <-- Complex password (meets Windows rules)
+          # Use a password that satisfies Windows complexity policy
+          $fixedPassword = "Gurjar@2025!"
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
 
           try {
@@ -44,18 +39,15 @@ jobs:
                   Set-LocalUser -Name 'RDP' -Password $securePass -ErrorAction Stop
               } else {
                   Write-Host "Creating new RDP user."
-                  New-LocalUser -Name 'RDP' -Password $securePass -FullName 'RDP User' -Description 'Fixed Password Account' -AccountNeverExpires -ErrorAction Stop
+                  New-LocalUser -Name 'RDP' -Password $securePass -FullName 'RDP User' -Description 'Fixed Complex Password Account' -AccountNeverExpires -ErrorAction Stop
                   Add-LocalGroupMember -Group 'Administrators' -Member 'RDP' -ErrorAction SilentlyContinue
                   Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'RDP' -ErrorAction SilentlyContinue
               }
 
-              # Export credentials to GITHUB_ENV for runtime steps
               Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: RDP | Password: $fixedPassword"
               $env:RDP_CREDS = "User: RDP | Password: $fixedPassword"
-
               Write-Host "✅ RDP user ready. Username: RDP, Password: $fixedPassword"
-          }
-          catch {
+          } catch {
               Write-Error "Failed creating/updating 'RDP' user: $($_.Exception.Message)"
               exit 1
           }
@@ -64,7 +56,6 @@ jobs:
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = Join-Path -Path $env:TEMP -ChildPath "tailscale.msi"
-
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
@@ -72,72 +63,37 @@ jobs:
       - name: Establish Tailscale Connection
         run: |
           $tailscaleExe = Join-Path -Path $env:ProgramFiles -ChildPath 'Tailscale\tailscale.exe'
-          if (-not (Test-Path $tailscaleExe)) {
-              Write-Error "Tailscale executable not found."
-              exit 1
-          }
-
-          # Embedded auth key (as you asked). Consider moving into secrets for safety.
+          if (-not (Test-Path $tailscaleExe)) { Write-Error "Tailscale not found"; exit 1 }
           $authKey = "tskey-auth-kfwPw32Zkb11CNTRL-UcY3V2VN9vC6ovzxjTdnuCN8DMP2vs5K"
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
-
           & $tailscaleExe up --authkey="$authKey" --hostname="$hostname" --accept-routes --accept-dns=true
 
-          # Wait for IPv4
-          $tsIP = $null
-          $retries = 0
+          $tsIP = $null; $retries = 0
           while (-not $tsIP -and $retries -lt 12) {
               $raw = & $tailscaleExe ip -4 2>$null
-              if ($raw) {
-                  $candidate = ($raw -split '\s+')[0]
-                  if ($candidate -match '^\d{1,3}(\.\d{1,3}){3}$') {
-                      $tsIP = $candidate
-                      break
-                  }
-              }
-              Start-Sleep -Seconds 5
-              $retries++
+              if ($raw) { $candidate = ($raw -split '\s+')[0]; if ($candidate -match '^\d{1,3}(\.\d{1,3}){3}$') { $tsIP = $candidate; break } }
+              Start-Sleep -Seconds 5; $retries++
           }
-
-          if (-not $tsIP) {
-              Write-Error "No Tailscale IP assigned after retries."
-              exit 1
-          }
-
+          if (-not $tsIP) { Write-Error "No Tailscale IP"; exit 1 }
           Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
           $env:TAILSCALE_IP = $tsIP
-          Write-Host "✅ Tailscale connected. IP: $tsIP"
+          Write-Host "✅ Tailscale IP: $tsIP"
 
       - name: Verify RDP Port
         run: |
-          if (-not $env:TAILSCALE_IP) {
-              Write-Error "TAILSCALE_IP not set."
-              exit 1
-          }
+          if (-not $env:TAILSCALE_IP) { Write-Error "TAILSCALE_IP not set"; exit 1 }
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) { Write-Error "RDP port not reachable"; exit 1 }
+          Write-Host "✅ RDP port reachable"
 
-          Write-Host "Testing RDP at $env:TAILSCALE_IP:3389"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to 3389 failed"
-              exit 1
-          }
-          Write-Host "✅ RDP Port 3389 reachable!"
-
-      - name: Maintain Connection (timed keep-alive)
+      - name: Maintain Connection (masked creds + timed)
         run: |
           if ($env:RDP_CREDS) { Write-Host "::add-mask::${env:RDP_CREDS}" }
-
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $($env:TAILSCALE_IP)"
           Write-Host "Username: RDP"
           Write-Host "Password: Gurjar@2025!"
           Write-Host "==================`n"
-
-          $minutes = 360
-          $endTime = (Get-Date).AddMinutes($minutes)
-          while ((Get-Date) -lt $endTime) {
-              Write-Host "[$(Get-Date -Format o)] RDP Active - will stop at $($endTime.ToString('o'))"
-              Start-Sleep -Seconds 300
-          }
-
-          Write-Host "⏹ RDP session timeout reached."
+          $end = (Get-Date).AddMinutes(360)
+          while ((Get-Date) -lt $end) { Write-Host "Alive: $(Get-Date -Format o)"; Start-Sleep -Seconds 300 }
+          Write-Host "Done"
